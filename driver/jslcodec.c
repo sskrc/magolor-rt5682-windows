@@ -31,10 +31,13 @@
 #define R_CBJ_CTRL_3       0x0012
 #define R_CBJ_CTRL_5       0x0014
 #define R_CBJ_CTRL_7       0x0016
+#define R_CBJ_BST_CTRL     0x000b
 #define R_DAC1_DIG_VOL     0x0019
+#define R_STO1_ADC_DIG_VOL 0x001c
 #define R_STO1_ADC_MIXER   0x0026
 #define R_STO1_DAC_MIXER   0x002a
 #define R_A_DAC1_MUX       0x002b
+#define R_REC_MIXER        0x003c
 #define R_CAL_REC          0x0044
 #define R_PWR_DIG_1        0x0061
 #define R_PWR_DIG_2        0x0062
@@ -118,6 +121,10 @@
 #define PWR_LDO       (1u << 8)
 #define DIG_GATE_CTRL (1u << 0)
 #define PWR_DAC_S1F   (1u << 10)
+#define PWR_ADC_S1F   (1u << 15)
+#define PWR_ADC_L1    (1u << 4)
+#define PWR_RM1_L     (1u << 1)
+#define SEL_ADCDAT    (1u << 15)
 /* HP */
 #define HP_C2_DAC_AMP_MUTE (1u << 15)
 #define HP_C2_DAC_L_EN     (1u << 14)
@@ -141,6 +148,7 @@
 #define DAC_STO1_ASRC (1u << 12)
 #define DA_ASRC       (1u << 13)
 #define AD_ASRC       (1u << 8)
+#define ADC_STO1_ASRC (1u << 2)
 #define SYS_CLK_DET   (1u << 15)
 #define POW_CLK_DET   (1u << 0)
 #define PLL_N_SFT 7
@@ -259,7 +267,7 @@ typedef struct {
     BOOLEAN ready;          /* codec initialised in this D0 */
     BOOLEAN veIc;
     ULONG   jackType;       /* 0 = none, 1 = headphone, 2 = headset */
-    BOOLEAN hpOn;
+    BOOLEAN hpOn, micOn, commonOn;
     ULONG   i2cErrors;
     WDFTIMER timer;
     WDFWAITLOCK lock;
@@ -403,6 +411,11 @@ static VOID ConfigureClocksAndFormat(CODEC *c)
     /* mixer controls (UCM-style defaults): Stereo1 DAC MIX L <- DAC L1, R <- DAC R1; HPOL/HPOR switches on */
     Upd(c, R_STO1_DAC_MIXER, (1u << 15) | (1u << 5), 0);
     Upd(c, R_HP_CTRL_1, L_MUTE | R_MUTE, 0);
+    /* headset mic: RECMIX1L CBJ switch on, CBJ boost 30 dB, Stereo1 ADC L1/R1 source = ADC, L/R = ADC1 L,
+       ADC1 switches on, ADC2 (DMIC) switches off  ->  STO1_ADC_MIXER = 0x6060 */
+    Upd(c, R_REC_MIXER, 1u << 7, 0);
+    Upd(c, R_CBJ_BST_CTRL, 0xfu << 8, 3u << 8);
+    Wr(c, R_STO1_ADC_MIXER, 0x6060);
 }
 
 static VOID PushButtonIrq(CODEC *c, BOOLEAN enable)
@@ -469,7 +482,7 @@ static ULONG HeadsetDetect(CODEC *c, BOOLEAN insert)
     }
     PushButtonIrq(c, FALSE);
     Upd(c, R_CBJ_CTRL_1, TRIG_JD_HIGH, 0);
-    if (!c->hpOn) Upd(c, R_PWR_ANLG_1, PWR_MB | PWR_VREF2, 0);   /* PLL1 / mic paths are off */
+    if (!c->commonOn) Upd(c, R_PWR_ANLG_1, PWR_MB | PWR_VREF2, 0);   /* PLL1 / mic paths are off */
     Upd(c, R_PWR_ANLG_3, PWR_CBJ, 0);
     Upd(c, R_MICBIAS_2, PWR_CLK25M_1M, 0);
     Upd(c, R_CBJ_CTRL_1, FAST_OFF_EN, 0);
@@ -477,27 +490,67 @@ static ULONG HeadsetDetect(CODEC *c, BOOLEAN insert)
     return 0;
 }
 
-/* DAPM power-up of AIF1RX -> DAC L1/R1 -> Stereo1 DAC mixer -> HP Amp -> HPO (supplies first) */
-static VOID HeadphonePower(CODEC *c, BOOLEAN on)
+/* supplies shared by playback and capture: bias, LDO2, PLL1, Vref1, I2S1, CLKDET, ASRC */
+static VOID CommonPower(CODEC *c, BOOLEAN on)
 {
-    if (on == c->hpOn) return;
+    if (on == c->commonOn) return;
     if (on) {
         /* bias PREPARE */
         Upd(c, R_PWR_ANLG_1, PWR_BG, PWR_BG);
         Upd(c, R_PWR_DIG_1, DIG_GATE_CTRL | PWR_LDO, DIG_GATE_CTRL | PWR_LDO);
-        /* supplies: LDO2, PLL1, Vref1 */
         Upd(c, R_PWR_ANLG_3, PWR_LDO2 | PWR_PLL, PWR_LDO2 | PWR_PLL);
-        Upd(c, R_PWR_ANLG_1, PWR_FV1, 0);
+        Upd(c, R_PWR_ANLG_1, PWR_FV1, 0);              /* Vref1 (rt5682_set_verf) */
         Upd(c, R_PWR_ANLG_1, PWR_VREF1, PWR_VREF1);
         SleepMs(20);
         Upd(c, R_PWR_ANLG_1, PWR_FV1, PWR_FV1);
-        /* DAC Stereo1 Filter (set_filter_clk done at configure time), I2S1, HP Amp L/R, CLKDET */
-        Upd(c, R_PWR_DIG_2, PWR_DAC_S1F, PWR_DAC_S1F);
         Upd(c, R_PWR_DIG_1, PWR_I2S1, PWR_I2S1);
-        Upd(c, R_PWR_ANLG_1, PWR_HA_L | PWR_HA_R, PWR_HA_L | PWR_HA_R);
         Upd(c, R_CLK_DET, POW_CLK_DET | SYS_CLK_DET, POW_CLK_DET | SYS_CLK_DET);
-        /* sequenced supplies: ASRC + charge pump (1), capless (2), DAC1 clock (3) */
-        Upd(c, R_PLL_TRACK_1, DAC_STO1_ASRC | DA_ASRC | AD_ASRC, DAC_STO1_ASRC | DA_ASRC | AD_ASRC);
+        Upd(c, R_PLL_TRACK_1, DAC_STO1_ASRC | ADC_STO1_ASRC | DA_ASRC | AD_ASRC,
+                              DAC_STO1_ASRC | ADC_STO1_ASRC | DA_ASRC | AD_ASRC);
+    } else {
+        Upd(c, R_PLL_TRACK_1, DAC_STO1_ASRC | ADC_STO1_ASRC | DA_ASRC | AD_ASRC, 0);
+        Upd(c, R_CLK_DET, POW_CLK_DET | SYS_CLK_DET, 0);
+        Upd(c, R_PWR_DIG_1, PWR_I2S1, 0);
+        Upd(c, R_PWR_ANLG_1, PWR_VREF1, 0);
+        Upd(c, R_PWR_ANLG_3, PWR_LDO2 | PWR_PLL, 0);
+        Upd(c, R_PWR_DIG_1, PWR_LDO, 0);               /* bias STANDBY */
+    }
+    c->commonOn = on;
+}
+
+/* headset mic: IN1P(CBJ) -> BST1 -> RECMIX1L -> ADC1 L -> Stereo1 ADC MIX (L and R from ADC1 L) -> AIF1TX */
+static VOID MicPower(CODEC *c, BOOLEAN on)
+{
+    if (on == c->micOn) return;
+    if (on) {
+        Upd(c, R_PLL_TRACK_3, FILTER_CLK_DIV_MASK, 1u << 8);    /* set_filter_clk (ADC) */
+        Upd(c, R_PWR_DIG_2, PWR_ADC_S1F, PWR_ADC_S1F);
+        Upd(c, R_PWR_ANLG_2, PWR_RM1_L, PWR_RM1_L);
+        Upd(c, R_PWR_DIG_1, PWR_ADC_L1, PWR_ADC_L1);
+        Upd(c, R_CHOP_ADC, 1u << 12, 1u << 12);                 /* ADC1 clock */
+        Upd(c, R_STO1_ADC_DIG_VOL, L_MUTE | R_MUTE, 0);          /* Stereo1 ADC MIXL/R */
+        Upd(c, R_I2S1_SDP, SEL_ADCDAT, 0);                       /* AIF1TX */
+    } else {
+        Upd(c, R_I2S1_SDP, SEL_ADCDAT, SEL_ADCDAT);
+        Upd(c, R_STO1_ADC_DIG_VOL, L_MUTE | R_MUTE, L_MUTE | R_MUTE);
+        Upd(c, R_CHOP_ADC, 1u << 12, 0);
+        Upd(c, R_PWR_DIG_1, PWR_ADC_L1, 0);
+        Upd(c, R_PWR_ANLG_2, PWR_RM1_L, 0);
+        Upd(c, R_PWR_DIG_2, PWR_ADC_S1F, 0);
+    }
+    c->micOn = on;
+    Log("headset mic path %s", on ? "ON" : "off");
+}
+
+/* DAPM power-up of AIF1RX -> DAC L1/R1 -> Stereo1 DAC mixer -> HP Amp -> HPO (common supplies first) */
+static VOID HeadphonePower(CODEC *c, BOOLEAN on)
+{
+    if (on == c->hpOn) return;
+    if (on) {
+        /* DAC Stereo1 Filter (set_filter_clk done at configure time), HP Amp L/R */
+        Upd(c, R_PWR_DIG_2, PWR_DAC_S1F, PWR_DAC_S1F);
+        Upd(c, R_PWR_ANLG_1, PWR_HA_L | PWR_HA_R, PWR_HA_L | PWR_HA_R);
+        /* sequenced supplies: charge pump (1), capless (2), DAC1 clock (3) */
         Upd(c, R_DEPOP_1, 1u << 3, 1u << 3);
         Upd(c, R_DEPOP_1, 1u << 0, 1u << 0);
         Upd(c, R_CHOP_DAC, 1u << 12, 1u << 12);
@@ -520,14 +573,8 @@ static VOID HeadphonePower(CODEC *c, BOOLEAN on)
         Upd(c, R_PWR_DIG_1, PWR_DAC_L1 | PWR_DAC_R1, 0);
         Upd(c, R_CHOP_DAC, 1u << 12, 0);
         Upd(c, R_DEPOP_1, (1u << 3) | (1u << 0), 0);
-        Upd(c, R_PLL_TRACK_1, DAC_STO1_ASRC | DA_ASRC | AD_ASRC, 0);
-        Upd(c, R_CLK_DET, POW_CLK_DET | SYS_CLK_DET, 0);
-        Upd(c, R_PWR_ANLG_1, PWR_HA_L | PWR_HA_R | PWR_VREF1, 0);
-        Upd(c, R_PWR_DIG_1, PWR_I2S1, 0);
+        Upd(c, R_PWR_ANLG_1, PWR_HA_L | PWR_HA_R, 0);
         Upd(c, R_PWR_DIG_2, PWR_DAC_S1F, 0);
-        Upd(c, R_PWR_ANLG_3, PWR_LDO2 | PWR_PLL, 0);
-        /* bias STANDBY */
-        Upd(c, R_PWR_DIG_1, PWR_LDO, 0);
     }
     c->hpOn = on;
     Log("headphone path %s", on ? "ON" : "off");
@@ -562,9 +609,16 @@ static NTSTATUS CodecInit(CODEC *c)
     /* bias STANDBY */
     Upd(c, R_PWR_DIG_1, DIG_GATE_CTRL, DIG_GATE_CTRL);
     EnableJackDetect(c);
-    c->jackType = 0; c->hpOn = FALSE;
+    c->jackType = 0; c->hpOn = c->micOn = c->commonOn = FALSE;
     Log("init done, i2c errors=%u", c->i2cErrors);
     return STATUS_SUCCESS;
+}
+
+static VOID AllPathsOff(CODEC *c)
+{
+    MicPower(c, FALSE);
+    HeadphonePower(c, FALSE);
+    CommonPower(c, FALSE);
 }
 
 /* rt5682_jack_detect_handler, polled */
@@ -573,9 +627,11 @@ static VOID JackPoll(CODEC *c)
     BOOLEAN in = !(Rd(c, R_AJD1_CTRL) & JDH_RS_MASK);
     if (in && c->jackType == 0) {
         c->jackType = HeadsetDetect(c, TRUE);
+        CommonPower(c, TRUE);
         HeadphonePower(c, TRUE);
+        if (c->jackType == 2) MicPower(c, TRUE);
     } else if (!in && c->jackType != 0) {
-        HeadphonePower(c, FALSE);
+        AllPathsOff(c);
         c->jackType = HeadsetDetect(c, FALSE);
     }
 }
@@ -667,7 +723,7 @@ NTSTATUS EvtD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     WdfTimerStop(c->timer, TRUE);
     WdfWaitLockAcquire(c->lock, NULL);
     if (wasReady) {
-        HeadphonePower(c, FALSE);
+        AllPathsOff(c);
         Reset(c);
         c->jackType = 0;
     }
