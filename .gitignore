@@ -1,0 +1,9 @@
+/out/
+/pkg/
+*.obj
+*.pdb
+*.sys
+*.cat
+*.log
+*.pfx
+*.cer
